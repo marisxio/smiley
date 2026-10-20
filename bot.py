@@ -48,11 +48,23 @@ async def on_ready():
 
 
 async def get_forum_threads(forum: discord.ForumChannel, *, include_archived: bool = True):
-    """Return active threads and, when possible, archived threads from a forum."""
+    """Fetch active threads from Discord, plus archived threads where accessible.
+
+    The channel's local ``forum.threads`` cache is not guaranteed to contain every
+    active post. Looking only there can make /add mistakenly create duplicates.
+    """
     threads = {thread.id: thread for thread in forum.threads}
+    try:
+        active_threads = await forum.guild.active_threads()
+        for thread in active_threads:
+            if thread.parent_id == forum.id:
+                threads[thread.id] = thread
+    except (AttributeError, discord.Forbidden, discord.HTTPException) as exc:
+        print(f"Could not fetch all active threads for #{forum.name}: {exc}")
+
     if include_archived:
         try:
-            async for thread in forum.archived_threads(limit=100):
+            async for thread in forum.archived_threads(limit=None):
                 threads[thread.id] = thread
         except (discord.Forbidden, discord.HTTPException) as exc:
             print(f"Could not list archived threads in #{forum.name}: {exc}")
