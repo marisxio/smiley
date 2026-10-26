@@ -1,4 +1,6 @@
 import os
+import sqlite3
+from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -25,6 +27,75 @@ class ResourceBot(commands.Bot):
             print("Global commands synced; they can take longer to appear.")
 
 bot = ResourceBot(command_prefix="!", intents=intents)
+
+# Persist counts in SQLite. On Railway, mount a Volume at /data and set
+# LEAK_DB_PATH=/data/leaks.sqlite3 so the database survives redeploys.
+DB_PATH = os.getenv("LEAK_DB_PATH", "leaks.sqlite3")
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("CREATE TABLE IF NOT EXISTS leaks (message_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, created_at TEXT NOT NULL, source TEXT NOT NULL)")
+    conn.commit()
+    return conn
+
+def record_leak(message_id: int, user_id: int, guild_id: int, channel_id: int, created_at: datetime, source: str = "live") -> bool:
+    """Record each resource message once. Returns True only for a new record."""
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO leaks(message_id,user_id,guild_id,channel_id,created_at,source) VALUES(?,?,?,?,?,?)",
+            (str(message_id), str(user_id), str(guild_id), str(channel_id), created_at.astimezone(timezone.utc).isoformat(), source),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+def month_bounds(now=None):
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if start.month == 12:
+        end = start.replace(year=start.year + 1, month=1)
+    else:
+        end = start.replace(month=start.month + 1)
+    return start.isoformat(), end.isoformat()
+
+def leak_count(user_id: int, *, monthly: bool = True) -> int:
+    conn = db_connect()
+    try:
+        if monthly:
+            start, end = month_bounds()
+            row = conn.execute("SELECT COUNT(*) FROM leaks WHERE user_id=? AND created_at>=? AND created_at<?", (str(user_id), start, end)).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) FROM leaks WHERE user_id=?", (str(user_id),)).fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+def estimated_payment(count: int) -> int:
+    return (count // 10) * 5
+
+def is_staff(interaction: discord.Interaction) -> bool:
+    return isinstance(interaction.user, discord.Member) and (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator)
+
+def user_id_from_embed(message: discord.Message) -> int | None:
+    # /add posts are sent by the bot, so historical ownership is stored in the embed.
+    # Older human-authored resource messages fall back to message.author below.
+    for embed in message.embeds:
+        for field in embed.fields:
+            if field.name.casefold().strip() in {"leaked by", "added by"}:
+                import re
+                match = re.search(r"<@!?(\d{15,22})>", field.value)
+                if match:
+                    return int(match.group(1))
+    if message.author and not message.author.bot:
+        return message.author.id
+    return None
+
+def looks_like_resource(message: discord.Message) -> bool:
+    # Resource messages use an embed title and a Creator field. This avoids counting
+    # the initial creator-thread starter message as a leak.
+    return any(e.title and any(f.name.casefold().strip() == "creator" for f in e.fields) for e in message.embeds)
 
 
 def has_role(interaction: discord.Interaction) -> bool:
@@ -158,7 +229,8 @@ async def add(
             # The bot needs Manage Threads permission to reopen archived/locked posts.
             await thread.edit(archived=False, locked=False)
 
-        await thread.send(embed=embed, files=files, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        resource_message = await thread.send(embed=embed, files=files, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        record_leak(resource_message.id, interaction.user.id, interaction.guild_id, channel.id, resource_message.created_at, "live")
         status = "Created a creator post and added the resource" if created else "Added the resource to the existing creator post"
         await interaction.followup.send(f"{status}: **{discord.utils.escape_markdown(creator)}** in {channel.mention}. [Open creator post]({thread.jump_url})", ephemeral=True)
     except discord.Forbidden:
@@ -242,5 +314,99 @@ async def recent(interaction: discord.Interaction, channel: discord.ForumChannel
     lines = [f"• **{discord.utils.escape_markdown(thread.name)}** — [open creator post]({thread.jump_url})" for thread in threads[:8]]
     embed = discord.Embed(title=f"Recent creator posts · #{target.name}", description="\n".join(lines), color=discord.Color.blurple())
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="leaks", description="View a leaker's leak count for this month.")
+@app_commands.describe(user="Leaker to check; defaults to yourself")
+async def leaks(interaction: discord.Interaction, user: discord.Member | None = None):
+    target = user or interaction.user
+    if user and user.id != interaction.user.id and not is_staff(interaction):
+        await interaction.response.send_message("Only staff can view another member's leak count.", ephemeral=True)
+        return
+    count = leak_count(target.id, monthly=True)
+    total = leak_count(target.id, monthly=False)
+    embed = discord.Embed(title=f"♡ Leak count · {target.display_name}", color=discord.Color.blurple())
+    embed.add_field(name="This month", value=f"**{count}** leaks", inline=True)
+    embed.add_field(name="Estimated payment", value=f"**${estimated_payment(count)}**", inline=True)
+    embed.add_field(name="All recorded time", value=f"**{total}** leaks", inline=True)
+    embed.set_footer(text="$5 per full 10 leaks · historical counts depend on available forum history")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="leakerboard", description="Show this month's top leakers.")
+async def leakerboard(interaction: discord.Interaction):
+    if not interaction.guild_id:
+        await interaction.response.send_message("Use this command in your server.", ephemeral=True)
+        return
+    start, end = month_bounds()
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT user_id, COUNT(*) AS n FROM leaks WHERE guild_id=? AND created_at>=? AND created_at<? GROUP BY user_id ORDER BY n DESC LIMIT 10", (str(interaction.guild_id), start, end)).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        await interaction.response.send_message("No leaks have been counted this month yet.", ephemeral=True)
+        return
+    lines = []
+    for rank, (uid, count) in enumerate(rows, start=1):
+        lines.append(f"**{rank}.** <@{uid}> — **{count}** leaks · ${estimated_payment(int(count))}")
+    embed = discord.Embed(title="୨୧ Monthly leakerboard", description="\n".join(lines), color=discord.Color.blurple())
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="backfill_leaks", description="Staff: scan existing resource replies in both resource forums.")
+@app_commands.describe(channel="Optional: scan only one forum; otherwise scans both known resource forums")
+async def backfill_leaks(interaction: discord.Interaction, channel: discord.ForumChannel | None = None):
+    if not is_staff(interaction):
+        await interaction.response.send_message("This is a staff-only command (Manage Server required).", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside your server.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if channel:
+        forums = [channel]
+    else:
+        # Preferred: set FORUM_CHANNEL_IDS=123,456 in Railway. If unset, use names.
+        configured = [x.strip() for x in os.getenv("FORUM_CHANNEL_IDS", "").split(",") if x.strip()]
+        if configured:
+            forums = [interaction.guild.get_channel(int(cid)) for cid in configured]
+            forums = [f for f in forums if isinstance(f, discord.ForumChannel)]
+        else:
+            names = {"after-effects", "mobile-resources"}
+            forums = [c for c in interaction.guild.channels if isinstance(c, discord.ForumChannel) and c.name.casefold() in names]
+    if not forums:
+        await interaction.followup.send("I couldn't find the forums. Set FORUM_CHANNEL_IDS to the two forum channel IDs in Railway, or check the channel names.", ephemeral=True)
+        return
+    scanned = added = skipped = 0
+    failures = []
+    for forum in forums:
+        try:
+            threads = await get_forum_threads(forum, include_archived=True)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            failures.append(f"#{forum.name}: couldn't list posts ({type(exc).__name__})")
+            continue
+        for thread in threads:
+            try:
+                # oldest_first doesn't matter because each Discord message ID is unique in SQLite.
+                async for message in thread.history(limit=None, oldest_first=True):
+                    if not looks_like_resource(message):
+                        continue
+                    scanned += 1
+                    submitter_id = user_id_from_embed(message)
+                    if submitter_id is None:
+                        skipped += 1
+                        continue
+                    if record_leak(message.id, submitter_id, interaction.guild_id, forum.id, message.created_at, "backfill"):
+                        added += 1
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                failures.append(f"{thread.name}: couldn't read replies ({type(exc).__name__})")
+    msg = f"**Historical scan finished**\nForums scanned: {len(forums)}\nResource messages checked: {scanned}\nNew leak records added: {added}\nAlready counted / duplicates ignored: {scanned - added - skipped}\nCould not identify a submitter: {skipped}"
+    if failures:
+        msg += "\n\n**Some history was inaccessible:**\n" + "\n".join(f"• {x}" for x in failures[:8])
+        msg += "\nCheck View Channel, Read Message History, and access to archived posts; then rerun safely."
+    msg += "\n\nYou can rerun this command; existing message IDs won't be counted twice."
+    await interaction.followup.send(msg, ephemeral=True)
+
 
 bot.run(TOKEN)
