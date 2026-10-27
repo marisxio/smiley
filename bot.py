@@ -300,7 +300,7 @@ async def add(
 
 
 @bot.tree.command(name="search", description="Search creator posts and resources in a forum.")
-@app_commands.describe(query="Words from creator, resource name, description, or link", channel="Forum to search; defaults to this forum")
+@app_commands.describe(query="Search creator names, resource names, descriptions, or links", channel="Forum to search; defaults to this forum")
 async def search(interaction: discord.Interaction, query: str, channel: discord.ForumChannel | None = None):
     if not await role_check(interaction):
         return
@@ -343,6 +343,97 @@ async def search(interaction: discord.Interaction, query: str, channel: discord.
     lines = [f"• **{discord.utils.escape_markdown(resource)}** in **{discord.utils.escape_markdown(thread.name)}** — [open post]({thread.jump_url})" for thread, resource in found]
     embed = discord.Embed(title=f"Search results: {query[:180]}", description="\n".join(lines), color=discord.Color.blurple())
     embed.set_footer(text=f"Forum: #{target.name} · up to 8 results")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="creator", description="Find creator posts by creator name.")
+@app_commands.describe(name="Full or partial creator name", channel="Optional forum; otherwise searches both resource forums")
+async def creator(interaction: discord.Interaction, name: str, channel: discord.ForumChannel | None = None):
+    if not await role_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside your server.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if channel:
+        forums = [channel]
+    else:
+        configured = [x.strip() for x in os.getenv("FORUM_CHANNEL_IDS", "").split(",") if x.strip()]
+        if configured:
+            forums = [interaction.guild.get_channel(int(cid)) for cid in configured]
+            forums = [f for f in forums if isinstance(f, discord.ForumChannel)]
+        else:
+            names = {"after-effects", "mobile-resources"}
+            forums = [c for c in interaction.guild.channels if isinstance(c, discord.ForumChannel) and c.name.casefold() in names]
+    if not forums:
+        await interaction.followup.send("I couldn't find the resource forums. Set FORUM_CHANNEL_IDS in Railway or check the forum names.", ephemeral=True)
+        return
+    needle = name.strip().casefold()
+    matches = []
+    for forum in forums:
+        try:
+            for thread in await get_forum_threads(forum):
+                if needle in thread.name.casefold():
+                    matches.append((thread, forum))
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+    matches.sort(key=lambda item: item[0].last_message_id or item[0].id, reverse=True)
+    if not matches:
+        await interaction.followup.send(f"No creator names matching **{discord.utils.escape_markdown(name)}** were found.", ephemeral=True)
+        return
+    lines = [f"• **{discord.utils.escape_markdown(thread.name)}** · #{forum.name} — [open creator post]({thread.jump_url})" for thread, forum in matches[:10]]
+    embed = discord.Embed(title=f"Creator search: {name[:180]}", description="\n".join(lines), color=discord.Color.blurple())
+    embed.set_footer(text=f"Showing up to 10 of {len(matches)} matches")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="latest", description="Show the most recently added resource leak.")
+@app_commands.describe(channel="Optional forum; otherwise checks both resource forums")
+async def latest(interaction: discord.Interaction, channel: discord.ForumChannel | None = None):
+    if not await role_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside your server.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if channel:
+        forums = [channel]
+    else:
+        configured = [x.strip() for x in os.getenv("FORUM_CHANNEL_IDS", "").split(",") if x.strip()]
+        if configured:
+            forums = [interaction.guild.get_channel(int(cid)) for cid in configured]
+            forums = [f for f in forums if isinstance(f, discord.ForumChannel)]
+        else:
+            names = {"after-effects", "mobile-resources"}
+            forums = [c for c in interaction.guild.channels if isinstance(c, discord.ForumChannel) and c.name.casefold() in names]
+    if not forums:
+        await interaction.followup.send("I couldn't find the resource forums. Set FORUM_CHANNEL_IDS in Railway or check the forum names.", ephemeral=True)
+        return
+    newest = None
+    failures = []
+    for forum in forums:
+        try:
+            threads = await get_forum_threads(forum)
+        except (discord.Forbidden, discord.HTTPException):
+            failures.append(forum.name)
+            continue
+        for thread in threads:
+            try:
+                async for message in thread.history(limit=100, oldest_first=False):
+                    if looks_like_resource(message):
+                        if newest is None or message.created_at > newest[0].created_at:
+                            newest = (message, thread, forum)
+                        break
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+    if newest is None:
+        extra = f" I couldn't read: {', '.join(failures)}." if failures else ""
+        await interaction.followup.send("I couldn't find any accessible resource posts." + extra, ephemeral=True)
+        return
+    message, thread, forum = newest
+    resource_name = next((e.title for e in message.embeds if e.title), "Untitled resource")
+    creator_name = next((f.value for e in message.embeds for f in e.fields if f.name.casefold().strip() == "creator"), thread.name)
+    embed = discord.Embed(title="Most recent leak", description=f"**Resource:** {discord.utils.escape_markdown(resource_name)}\n**Creator:** {discord.utils.escape_markdown(creator_name)}\n**Forum:** {forum.mention}\n**Added:** <t:{int(message.created_at.timestamp())}:R>\n[Open resource message]({message.jump_url})", color=discord.Color.blurple())
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
