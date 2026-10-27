@@ -35,6 +35,11 @@ DB_PATH = os.getenv("LEAK_DB_PATH", "leaks.sqlite3")
 def db_connect():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("CREATE TABLE IF NOT EXISTS leaks (message_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, created_at TEXT NOT NULL, source TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS monthly_resets (guild_id TEXT PRIMARY KEY, reset_at TEXT NOT NULL, reset_by TEXT NOT NULL, new_payout_policy INTEGER NOT NULL DEFAULT 0)")
+    # Upgrade databases created by earlier bot versions without affecting the in-progress period.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(monthly_resets)").fetchall()}
+    if "new_payout_policy" not in columns:
+        conn.execute("ALTER TABLE monthly_resets ADD COLUMN new_payout_policy INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 
@@ -60,11 +65,31 @@ def month_bounds(now=None):
         end = start.replace(month=start.month + 1)
     return start.isoformat(), end.isoformat()
 
-def leak_count(user_id: int, *, monthly: bool = True) -> int:
+def effective_month_start(guild_id: int) -> tuple[str, str]:
+    """Return the active payout-period bounds for this server.
+
+    Before the first manual reset, the tally follows the calendar month. Once
+    the owner runs /reset_month, the new period starts at that timestamp and
+    continues across calendar-month boundaries until the owner resets again.
+    """
+    calendar_start, calendar_end = month_bounds()
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT reset_at FROM monthly_resets WHERE guild_id=?", (str(guild_id),)).fetchone()
+        if row:
+            return row[0], "9999-12-31T23:59:59+00:00"
+        return calendar_start, calendar_end
+    finally:
+        conn.close()
+
+def leak_count(user_id: int, *, monthly: bool = True, guild_id: int | None = None) -> int:
     conn = db_connect()
     try:
         if monthly:
-            start, end = month_bounds()
+            if guild_id is not None:
+                start, end = effective_month_start(guild_id)
+            else:
+                start, end = month_bounds()
             row = conn.execute("SELECT COUNT(*) FROM leaks WHERE user_id=? AND created_at>=? AND created_at<?", (str(user_id), start, end)).fetchone()
         else:
             row = conn.execute("SELECT COUNT(*) FROM leaks WHERE user_id=?", (str(user_id),)).fetchone()
@@ -72,8 +97,28 @@ def leak_count(user_id: int, *, monthly: bool = True) -> int:
     finally:
         conn.close()
 
-def estimated_payment(count: int) -> int:
-    return (count // 10) * 5
+MAX_PERIOD_PAYOUT = 20
+LEAKS_FOR_MAX_PAYOUT = 40  # $5 per full 10 leaks, capped at $20
+
+def new_payout_policy_active(guild_id: int | None) -> bool:
+    """The new $20 cap becomes active only after the owner starts a new period.
+
+    Until then, the in-progress period keeps the previous uncapped $5 per 10
+    leaks rule. The reset timestamp is persisted in SQLite.
+    """
+    if guild_id is None:
+        return False
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT new_payout_policy FROM monthly_resets WHERE guild_id=?", (str(guild_id),)).fetchone()
+        return bool(row and row[0])
+    finally:
+        conn.close()
+
+def estimated_payment(count: int, *, capped: bool = True) -> int:
+    """$5 per complete 10 leaks; apply the $20 cap only for activated periods."""
+    amount = (count // 10) * 5
+    return min(amount, MAX_PERIOD_PAYOUT) if capped else amount
 
 def is_staff(interaction: discord.Interaction) -> bool:
     return isinstance(interaction.user, discord.Member) and (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator)
@@ -232,7 +277,16 @@ async def add(
         resource_message = await thread.send(embed=embed, files=files, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
         record_leak(resource_message.id, interaction.user.id, interaction.guild_id, channel.id, resource_message.created_at, "live")
         status = "Created a creator post and added the resource" if created else "Added the resource to the existing creator post"
-        await interaction.followup.send(f"{status}: **{discord.utils.escape_markdown(creator)}** in {channel.mention}. [Open creator post]({thread.jump_url})", ephemeral=True)
+        current_count = leak_count(interaction.user.id, monthly=True, guild_id=interaction.guild_id)
+        confirmation = f"{status}: **{discord.utils.escape_markdown(creator)}** in {channel.mention}. [Open creator post]({thread.jump_url})"
+        if new_payout_policy_active(interaction.guild_id) and current_count >= LEAKS_FOR_MAX_PAYOUT:
+            confirmation += (
+                "\n\n⚠️ **Monthly leaking credit warning**\n"
+                "You've reached the 40 leaks needed for the maximum **$20** payout this period. "
+                "You can continue adding resources, but your payout will not increase above $20. "
+                "If you wish to continue, run `/add` again; otherwise, you can stop for this period."
+            )
+        await interaction.followup.send(confirmation, ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send("I don't have permission to create posts or send messages/files in that forum. Check Create Posts, Send Messages in Posts, Attach Files, Embed Links, Read Message History, and Manage Threads (for archived posts).", ephemeral=True)
     except discord.HTTPException as exc:
@@ -323,13 +377,15 @@ async def leaks(interaction: discord.Interaction, user: discord.Member | None = 
     if user and user.id != interaction.user.id and not is_staff(interaction):
         await interaction.response.send_message("Only staff can view another member's leak count.", ephemeral=True)
         return
-    count = leak_count(target.id, monthly=True)
+    count = leak_count(target.id, monthly=True, guild_id=interaction.guild_id)
     total = leak_count(target.id, monthly=False)
     embed = discord.Embed(title=f"♡ Leak count · {target.display_name}", color=discord.Color.blurple())
     embed.add_field(name="This month", value=f"**{count}** leaks", inline=True)
-    embed.add_field(name="Estimated payment", value=f"**${estimated_payment(count)}**", inline=True)
+    capped = new_payout_policy_active(interaction.guild_id)
+    embed.add_field(name="Estimated payment", value=f"**${estimated_payment(count, capped=capped)}**", inline=True)
     embed.add_field(name="All recorded time", value=f"**{total}** leaks", inline=True)
-    embed.set_footer(text="$5 per full 10 leaks · historical counts depend on available forum history")
+    footer = "$5 per 10 leaks · maximum $20 per payout period" if capped else "$5 per 10 leaks · current period keeps the previous payout rules until /reset_month"
+    embed.set_footer(text=footer + " · all-time count is uncapped")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -338,7 +394,7 @@ async def leakerboard(interaction: discord.Interaction):
     if not interaction.guild_id:
         await interaction.response.send_message("Use this command in your server.", ephemeral=True)
         return
-    start, end = month_bounds()
+    start, end = effective_month_start(interaction.guild_id)
     conn = db_connect()
     try:
         rows = conn.execute("SELECT user_id, COUNT(*) AS n FROM leaks WHERE guild_id=? AND created_at>=? AND created_at<? GROUP BY user_id ORDER BY n DESC LIMIT 10", (str(interaction.guild_id), start, end)).fetchall()
@@ -348,10 +404,38 @@ async def leakerboard(interaction: discord.Interaction):
         await interaction.response.send_message("No leaks have been counted this month yet.", ephemeral=True)
         return
     lines = []
+    capped = new_payout_policy_active(interaction.guild_id)
     for rank, (uid, count) in enumerate(rows, start=1):
-        lines.append(f"**{rank}.** <@{uid}> — **{count}** leaks · ${estimated_payment(int(count))}")
+        lines.append(f"**{rank}.** <@{uid}> — **{count}** leaks · ${estimated_payment(int(count), capped=capped)}")
     embed = discord.Embed(title="୨୧ Monthly leakerboard", description="\n".join(lines), color=discord.Color.blurple())
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="reset_month", description="Server owner only: start a fresh leak-count and payout period.")
+async def reset_month(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.guild_id:
+        await interaction.response.send_message("Use this command inside your server.", ephemeral=True)
+        return
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("Only the server owner can reset the monthly leak counts.", ephemeral=True)
+        return
+
+    reset_at = datetime.now(timezone.utc).isoformat()
+    conn = db_connect()
+    try:
+        conn.execute(
+            "INSERT INTO monthly_resets(guild_id, reset_at, reset_by, new_payout_policy) VALUES(?,?,?,1) "
+            "ON CONFLICT(guild_id) DO UPDATE SET reset_at=excluded.reset_at, reset_by=excluded.reset_by, new_payout_policy=1",
+            (str(interaction.guild_id), reset_at, str(interaction.user.id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    await interaction.response.send_message(
+        "୨୧ Fresh payout period started! The new system is now active: **$5 per 10 leaks, capped at $20 per period (maximum reached at 40 leaks)**. Everyone's period count and estimated payout start at 0 from this point; the leaderboard will build from new-period leaks. All-time records are preserved. Run `/reset_month` again when you're ready to begin another period.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="backfill_leaks", description="Staff: scan existing resource replies in both resource forums.")
