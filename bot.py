@@ -306,9 +306,9 @@ async def search(interaction: discord.Interaction, query: str, channel: discord.
         return
     target = channel or interaction.channel
     if not isinstance(target, discord.ForumChannel):
-        await interaction.response.send_message("Choose a forum channel.", ephemeral=True)
+        await interaction.response.send_message("Choose a forum channel.", ephemeral=False)
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(ephemeral=False, thinking=True)
     needle = query.casefold()
     found = []
     try:
@@ -335,15 +335,15 @@ async def search(interaction: discord.Interaction, query: str, channel: discord.
             if len(found) >= 8:
                 break
     except discord.Forbidden:
-        await interaction.followup.send("I can't read this forum. Check View Channel and Read Message History permissions.", ephemeral=True)
+        await interaction.followup.send("I can't read this forum. Check View Channel and Read Message History permissions.", ephemeral=False)
         return
     if not found:
-        await interaction.followup.send(f"No matches found in {target.mention}. I checked accessible active and recent archived creator posts.", ephemeral=True)
+        await interaction.followup.send(f"No matches found in {target.mention}. I checked accessible active and recent archived creator posts.", ephemeral=False)
         return
     lines = [f"• **{discord.utils.escape_markdown(resource)}** in **{discord.utils.escape_markdown(thread.name)}** — [open post]({thread.jump_url})" for thread, resource in found]
     embed = discord.Embed(title=f"Search results: {query[:180]}", description="\n".join(lines), color=discord.Color.blurple())
     embed.set_footer(text=f"Forum: #{target.name} · up to 8 results")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=False)
 
 
 @bot.tree.command(name="creator", description="Find creator posts by creator name.")
@@ -393,9 +393,9 @@ async def latest(interaction: discord.Interaction, channel: discord.ForumChannel
     if not await role_check(interaction):
         return
     if not interaction.guild:
-        await interaction.response.send_message("Use this command inside your server.", ephemeral=True)
+        await interaction.response.send_message("Use this command inside your server.", ephemeral=False)
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(ephemeral=False, thinking=True)
     if channel:
         forums = [channel]
     else:
@@ -407,7 +407,7 @@ async def latest(interaction: discord.Interaction, channel: discord.ForumChannel
             names = {"after-effects", "mobile-resources"}
             forums = [c for c in interaction.guild.channels if isinstance(c, discord.ForumChannel) and c.name.casefold() in names]
     if not forums:
-        await interaction.followup.send("I couldn't find the resource forums. Set FORUM_CHANNEL_IDS in Railway or check the forum names.", ephemeral=True)
+        await interaction.followup.send("I couldn't find the resource forums. Set FORUM_CHANNEL_IDS in Railway or check the forum names.", ephemeral=False)
         return
     newest = None
     failures = []
@@ -428,13 +428,13 @@ async def latest(interaction: discord.Interaction, channel: discord.ForumChannel
                 continue
     if newest is None:
         extra = f" I couldn't read: {', '.join(failures)}." if failures else ""
-        await interaction.followup.send("I couldn't find any accessible resource posts." + extra, ephemeral=True)
+        await interaction.followup.send("I couldn't find any accessible resource posts." + extra, ephemeral=False)
         return
     message, thread, forum = newest
     resource_name = next((e.title for e in message.embeds if e.title), "Untitled resource")
     creator_name = next((f.value for e in message.embeds for f in e.fields if f.name.casefold().strip() == "creator"), thread.name)
     embed = discord.Embed(title="Most recent leak", description=f"**Resource:** {discord.utils.escape_markdown(resource_name)}\n**Creator:** {discord.utils.escape_markdown(creator_name)}\n**Forum:** {forum.mention}\n**Added:** <t:{int(message.created_at.timestamp())}:R>\n[Open resource message]({message.jump_url})", color=discord.Color.blurple())
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=False)
 
 
 @bot.tree.command(name="recent", description="Show recently updated creator posts in a forum.")
