@@ -18,6 +18,9 @@ if not TOKEN:
 intents = discord.Intents.default()
 intents.guilds = True
 intents.messages = True
+# Required to inspect message text for X links. Also enable Message Content Intent
+# for this bot in the Discord Developer Portal.
+intents.message_content = True
 
 class ResourceBot(commands.Bot):
     async def setup_hook(self):
@@ -589,6 +592,39 @@ async def backfill_leaks(interaction: discord.Interaction, channel: discord.Foru
     await interaction.followup.send(msg, ephemeral=True)
 
 
-# X API monitoring and link-forwarding commands are intentionally not included in this build.
+# Automatic X-link styling (no X API token or credits required).
+# Set X_LINK_CHANNEL_ID in Railway to the one channel where links should be styled.
+X_LINK_CHANNEL_ID = os.getenv("X_LINK_CHANNEL_ID", "").strip()
+X_LINK_RE = re.compile(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/[^\s<>]+", re.IGNORECASE)
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignore DMs, other channels, and messages sent by bots to prevent loops.
+    if message.author.bot or not message.guild or not X_LINK_CHANNEL_ID:
+        return
+    if str(message.channel.id) != X_LINK_CHANNEL_ID:
+        return
+
+    matches = X_LINK_RE.findall(message.content or "")
+    if not matches:
+        return
+
+    # Trim common trailing punctuation that is not part of the URL.
+    link = matches[0].rstrip(".,!?;:)]}")
+    embed = discord.Embed(
+        title="୨୧  X link shared  ୨୧",
+        description=f"♡ [Open the original post]({link}) ♡\n\n୨୧・thank you for sharing!・୨୧",
+        color=discord.Color.from_rgb(255, 170, 205),
+    )
+    embed.set_footer(text="Smiley · link preview")
+    try:
+        await message.channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden:
+        print(f"Missing permission to send embeds in X link channel {message.channel.id}")
+    except discord.HTTPException as exc:
+        print(f"Could not format X link in channel {message.channel.id}: {exc}")
+
+    # Keep normal application commands working after adding on_message.
+    await bot.process_commands(message)
 
 bot.run(TOKEN)
