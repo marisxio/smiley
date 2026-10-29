@@ -3,7 +3,7 @@ import sqlite3
 import asyncio
 import re
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 import aiohttp
 import discord
 from discord import app_commands
@@ -787,6 +787,62 @@ async def monitor_x_accounts():
 @monitor_x_accounts.before_loop
 async def before_monitor_x_accounts():
     await bot.wait_until_ready()
+
+
+@bot.tree.command(name="sendlink", description="Staff: send a non-explicit X post link to a chosen channel.")
+@app_commands.describe(
+    url="Link to a public X/Twitter post",
+    channel="Discord text channel that should receive the link",
+    non_explicit_confirmed="Confirm this post is non-explicit and appropriate to share",
+)
+async def sendlink(
+    interaction: discord.Interaction,
+    url: str,
+    channel: discord.TextChannel,
+    non_explicit_confirmed: bool,
+):
+    """Manually forward a non-explicit X post link without using the X API."""
+    if not x_staff_context_ok(interaction):
+        await interaction.response.send_message(
+            "Staff only: use a channel configured as staff chat and have Manage Server permission.",
+            ephemeral=True,
+        )
+        return
+    if not interaction.guild or channel.guild.id != interaction.guild.id:
+        await interaction.response.send_message("Choose a destination text channel from this server.", ephemeral=True)
+        return
+    if not non_explicit_confirmed:
+        await interaction.response.send_message(
+            "Smiley only forwards non-explicit posts. Confirm that the post is non-explicit before sending it.",
+            ephemeral=True,
+        )
+        return
+
+    clean_url = url.strip()
+    parsed = urlparse(clean_url)
+    host = (parsed.hostname or "").casefold()
+    valid_host = host in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}
+    # Require a post-status URL, not an arbitrary external link or profile page.
+    if parsed.scheme != "https" or not valid_host or not re.search(r"/status/\d+", parsed.path):
+        await interaction.response.send_message(
+            "Please provide a direct public post URL, such as https://x.com/username/status/123456789.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        await channel.send(f"Creator post shared by {interaction.user.mention}: <{clean_url}>", suppress_embeds=True)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"I can't send messages in {channel.mention}. Give Smiley permission to View Channel and Send Messages.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as exc:
+        await interaction.followup.send(f"Discord couldn't send that link ({type(exc).__name__}).", ephemeral=True)
+        return
+    await interaction.followup.send(f"Sent the post link to {channel.mention}.", ephemeral=True)
 
 
 @bot.tree.command(name="addaccount", description="Staff: monitor an X account and send five recent eligible links.")
