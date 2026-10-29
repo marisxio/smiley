@@ -594,6 +594,7 @@ async def backfill_leaks(interaction: discord.Interaction, channel: discord.Foru
 
 # Automatic X-link styling (no X API token or credits required).
 # Set X_LINK_CHANNEL_ID in Railway to the one channel where links should be styled.
+# The original message is deleted only after Smiley successfully posts its replacement.
 X_LINK_CHANNEL_ID = os.getenv("X_LINK_CHANNEL_ID", "").strip()
 X_LINK_RE = re.compile(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/[^\s<>]+", re.IGNORECASE)
 
@@ -601,12 +602,15 @@ X_LINK_RE = re.compile(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/[^\s<>]+", r
 async def on_message(message: discord.Message):
     # Ignore DMs, other channels, and messages sent by bots to prevent loops.
     if message.author.bot or not message.guild or not X_LINK_CHANNEL_ID:
+        await bot.process_commands(message)
         return
     if str(message.channel.id) != X_LINK_CHANNEL_ID:
+        await bot.process_commands(message)
         return
 
     matches = X_LINK_RE.findall(message.content or "")
     if not matches:
+        await bot.process_commands(message)
         return
 
     # Trim common trailing punctuation that is not part of the URL.
@@ -623,8 +627,16 @@ async def on_message(message: discord.Message):
         print(f"Missing permission to send embeds in X link channel {message.channel.id}")
     except discord.HTTPException as exc:
         print(f"Could not format X link in channel {message.channel.id}: {exc}")
+    else:
+        # Discord requires Manage Messages to remove the original link message.
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            print(f"Smiley needs Manage Messages to delete link messages in channel {message.channel.id}")
+        except discord.HTTPException as exc:
+            print(f"Could not delete original link message {message.id}: {exc}")
 
-    # Keep normal application commands working after adding on_message.
+    # Preserve prefix commands even when a link was posted.
     await bot.process_commands(message)
 
 bot.run(TOKEN)
